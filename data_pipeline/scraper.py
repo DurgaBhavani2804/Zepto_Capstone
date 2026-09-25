@@ -117,3 +117,5 @@ print(
     .sort_values(["rating", "price_gbp"], ascending=[False, False])
     .head(10)
 )
+
+# Pipeline updated for capstone submission
