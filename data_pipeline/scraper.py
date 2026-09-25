@@ -119,3 +119,5 @@ print(
 )
 
 # Pipeline updated for capstone submission
+
+OUTPUT_LOG = 'query_output.txt'
