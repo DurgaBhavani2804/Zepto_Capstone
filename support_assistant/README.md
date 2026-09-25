@@ -1,83 +1,134 @@
-# Module 3 — Support Assistant
+# Support Assistant (Module 3)
 
-A RAG-based customer support assistant for Zepto: a document corpus embedded
-into ChromaDB, a LangGraph-orchestrated intent router + retriever, a
-schema-guaranteed JSON response, and a FastAPI wrapper.
+A small RAG service for Zepto: 8 policy documents, embedded locally and
+retrieved with ChromaDB, orchestrated through a LangGraph intent router, with
+a validated JSON output and a FastAPI wrapper.
 
-The graded baseline runs **fully offline** with `MOCK_LLM` at its default
-(unset, i.e. `"1"`) — no signup, no API key, and no network call to any LLM
-provider. A real LLM call (Groq free tier) and a Hugging Face Spaces
-deployment are both optional, ungraded extensions (`MOCK_LLM=0`).
+Every LLM call in this module is gated behind the `MOCK_LLM` environment
+variable. Left unset (the default, and what gets graded), the service is
+fully deterministic and offline: no signup, no API key, no network call to
+any LLM provider. Setting `MOCK_LLM=0` switches to an optional, ungraded
+real-LLM extension using Groq's free tier.
 
-## Project layout
+## Files
+
+| File | Purpose |
+|---|---|
+| `docs/doc_01.txt` … `doc_08.txt` | The 8-document policy corpus |
+| `rag.py` | Ingestion, chunking, embedding (sentence-transformers), ChromaDB storage + retrieval |
+| `prompts.py` | The structured prompt template (role/context/task/format/length, negative constraint, few-shot example) — used only by the optional `MOCK_LLM=0` path |
+| `schemas.py` | Pydantic request/response models + the LangGraph `TypedDict` state |
+| `graph.py` | The LangGraph `StateGraph`: 3 nodes, conditional routing edge, `MOCK_LLM` branch in each node |
+| `llm.py` | Optional real-LLM call (Groq) + schema-validation retry logic, only used when `MOCK_LLM=0` |
+| `main.py` | FastAPI app, `POST /ask` and `GET /health` |
+| `Dockerfile` | Builds and runs the FastAPI app in a container |
+
+## Architecture: how a request flows through the pipeline
+
+**1. Ingestion** (`rag.py: load_documents`, `chunk_documents`) — On the first
+app startup, the 8 files in `docs/` are read from disk. Each policy document
+is short and self-contained, so the simple, task-permitted chunking scheme
+used here is one chunk per document (8 chunks total, ids `doc_01` … `doc_08`).
+A fixed-size fallback (`max_chars`-based splitting) is included in the same
+function for robustness, in case a document were ever long enough to need it.
+
+**2. Embedding** (`rag.py: get_embedding_model`, `embed_texts`) — Each chunk's
+text is embedded locally with `sentence-transformers/all-MiniLM-L6-v2`
+(no API key, no account, runs on CPU). The resulting vectors are stored in a
+persistent ChromaDB collection called `zepto_policies`
+(`rag.py: get_collection`), so ingestion only happens once — later app starts
+reuse the collection already saved to disk in `chroma_db/`. This stage
+**never** depends on `MOCK_LLM`; it always runs for real in both modes.
+
+**3. Retrieval** (`rag.py: retrieve`, called from `graph.py: retrieve_and_answer`)
+— When a query needs policy context, it is embedded with the same MiniLM
+model, and ChromaDB returns the top-3 most similar chunks by cosine
+similarity. Like embedding, retrieval always runs for real in both modes.
+
+**4. Routing** (`graph.py: classify_intent`, `_route`) — The LangGraph entry
+node classifies the query as `policy_question` or `general_question`. In the
+default mock mode this is a plain keyword heuristic (checks for words like
+"delivery", "return", "refund", …) with no LLM call at all. A conditional
+edge then sends the state to either `retrieve_and_answer` or `direct_answer`.
+This routing decision itself never depends on `MOCK_LLM` — only what happens
+*inside* the two downstream nodes does.
+
+**5. Generation** (`graph.py: retrieve_and_answer` / `direct_answer`) — This
+is the only stage that branches on `MOCK_LLM`:
+- **Default (`MOCK_LLM` unset or `1`, graded baseline):** no LLM call at all.
+  `retrieve_and_answer` returns the canned template
+  `f"Based on the retrieved context: {top_chunk_snippet}"` using the top
+  retrieved chunk; `direct_answer` returns the fixed string *"I can only
+  answer questions about Zepto policies right now."* The output schema
+  (`answer` / `sources` / `confidence`) is populated directly by this code,
+  deterministically, since there is no LLM output to validate.
+- **Optional (`MOCK_LLM=0`):** `retrieve_and_answer` fills the structured
+  prompt in `prompts.py` with the retrieved chunks and asks a real LLM
+  (Groq, `llm.py`) to answer grounded only in that context; `direct_answer`
+  prompts the LLM with no retrieved context. In both cases the raw LLM
+  output is parsed as JSON and validated against the `AskResponse` Pydantic
+  model; on a validation failure it retries up to 2 more times with a
+  corrective instruction (`llm.py: generate_structured_answer`) before
+  falling back to a clearly marked `[error] ...` response.
+
+**6. API** (`main.py`) — `POST /ask` takes `{"query": str}`, invokes the
+compiled LangGraph (`graph.py: app_graph`), and returns the validated
+`AskResponse` JSON.
 
 ```
-support_assistant/
-├── docs/                  # 8 policy documents (Task: corpus)
-│   ├── doc_01.txt ... doc_08.txt
-├── ingest.py               # Task 1: load, chunk, embed, store in ChromaDB
-├── prompt_template.py      # Task 2: role/context/task/format/length prompt
-├── graph.py                 # Task 3+4: LangGraph StateGraph + routing + schema
-├── llm_client.py            # Optional MOCK_LLM=0 real-LLM client (Groq)
-├── schemas.py                # Task 5: Pydantic AskRequest/AskResponse
-├── main.py                    # Task 6: FastAPI app, POST /ask
-├── Dockerfile                  # Task 7: containerization
-├── requirements.txt
-└── README.md (this file)
+docs/*.txt --(load+chunk)--> rag.chunk_documents --(embed: MiniLM)-->
+ChromaDB(zepto_policies) <--(retrieve top-3)-- graph.retrieve_and_answer
+                                                        |
+query --> graph.classify_intent --(conditional edge)--> graph.retrieve_and_answer --> AskResponse
+                                \-----------------------> graph.direct_answer -------> AskResponse
 ```
 
-## Running locally
+## Running it locally
 
 ```bash
 cd support_assistant
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 7860
 ```
 
-The first request triggers `ingest.py`, which downloads
-`all-MiniLM-L6-v2` (one-time, from Hugging Face, no account/API key needed)
-and embeds the 8 corpus documents into a persistent ChromaDB collection
-under `support_assistant/chroma_db/`.
+The first request triggers ingestion (downloads the MiniLM model weights the
+very first time only, then reuses them; embeds the 8 docs into `chroma_db/`).
+
+## Running it in Docker
 
 ```bash
-curl -X POST http://localhost:7860/ask \
-     -H "Content-Type: application/json" \
-     -d '{"query": "How long does delivery usually take?"}'
-```
-
-## Running with Docker
-
-```bash
-cd support_assistant
 docker build -t zepto-support-assistant .
 docker run -p 7860:7860 zepto-support-assistant
 ```
 
-`MOCK_LLM` defaults to `1` inside the image. To try the optional real-LLM
-extension instead:
+## Example calls (MOCK_LLM left at its default)
 
+
+**1. A query that should trigger retrieval** (contains a policy keyword):
 ```bash
-docker run -p 7860:7860 -e MOCK_LLM=0 -e GROQ_API_KEY=<your_key> zepto-support-assistant
-```
-
-## Example calls (with MOCK_LLM left at default — this is what gets graded)
-
-**Example 1 — a question that should trigger document search:**
-```bash
-curl -X POST http://localhost:7860/ask -H "Content-Type: application/json" -d "{\"query\": \"How long does delivery take and is it free?\"}"
+curl -X POST http://localhost:7860/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How long does delivery take and is it free?"}'
 ```
 Response:
 ```json
 {
   "answer": "Based on the retrieved context: Zepto delivers grocery and household essentials to serviceable pin codes within 10 to 30 minutes of order confirmation, depending on the customer's delivery zone and current order volume. Standard del",
-  "sources": ["doc_01", "doc_05", "..."],
-  "confidence": 1.0
+  "sources": [
+    "doc_01",
+    "doc_05",
+    "doc_02"
+  ],
+  "confidence": 1
 }
 ```
 
-**Example 2 — a question that should NOT trigger document search:**
+**2. A query that should NOT trigger retrieval** (no policy keyword):
 ```bash
-curl -X POST http://localhost:7860/ask -H "Content-Type: application/json" -d "{\"query\": \"What is the capital of France?\"}"
+curl -X POST http://localhost:7860/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is the capital of France?"}'
 ```
 Response:
 ```json
@@ -87,94 +138,9 @@ Response:
   "confidence": 1
 }
 ```
-> **Note on how these transcripts were produced:** these two responses were
-> generated by running `graph.py`'s real `classify_intent` →
-> `retrieve_and_answer` / `direct_answer` control flow end-to-end (keyword
-> routing, canned-template generation, and Pydantic schema validation all
-> executed for real). The one piece substituted for this write-up was the
-> ChromaDB/sentence-transformers retrieval backend itself, because the
-> sandbox this was authored in has no network access to Hugging Face to
-> download `all-MiniLM-L6-v2`; a lightweight stand-in returning the same 8
-> corpus chunks was used instead, so `sources` reflects a simplified
-     top-3 ordering rather than true cosine similarity. Running
-> `uvicorn main:app` on a machine with normal internet access (as
-> `ingest.py` requires for its one-time model download) will reproduce this
-> same JSON shape with the real embedding-based `sources` ranking — re-run
-> the two calls above locally and swap in that output before final
-> submission if your grader expects transcripts captured from a live
-> `uvicorn` process rather than this write-up.
 
-## Architecture: the RAG pipeline, stage by stage
+## Optional extensions (not required for full marks)
 
-**1. Ingestion** — `ingest.py::load_documents()` reads the 8 files in
-`docs/doc_01.txt … doc_08.txt`. Each policy document is short (a single
-paragraph), so the chunking scheme is the simple per-document chunk allowed
-by the assignment: one file → one chunk, tagged with its filename stem as
-the chunk/document id (e.g. `doc_01`).
+- **Real LLM:** set `MOCK_LLM=0` and `GROQ_API_KEY=<your free-tier key>`
+  (from https://console.groq.com) before starting the server.
 
-**2. Embedding** — `ingest.py::get_or_build_collection()` embeds each of the
-8 chunks locally using `sentence-transformers`' `all-MiniLM-L6-v2` model via
-ChromaDB's built-in `SentenceTransformerEmbeddingFunction`. This runs
-entirely on-machine, at no cost, with no API key. The resulting vectors are
-stored in a persistent ChromaDB collection named `zepto_policies`
-(cosine-similarity space), on disk under `support_assistant/chroma_db/`, so
-re-embedding only happens once (the collection is reused, and only rebuilt
-if empty).
-
-**3. Retrieval** — the `retrieve_and_answer` LangGraph node
-(`graph.py`) embeds the incoming query with the same model and calls
-`collection.query(query_texts=[query], n_results=3)`, retrieving the
-top-3 most similar chunks by cosine similarity. This retrieval step always
-runs for real, in both `MOCK_LLM` modes, since it needs no API key and no
-network call to an LLM provider.
-
-**4. Generation** — routing happens first: `classify_intent`
-(`graph.py`) decides whether the query is `policy_question` or
-`general_question`, and a conditional edge (`route_after_classify`) sends
-`policy_question` queries to `retrieve_and_answer` and everything else to
-`direct_answer`. Only the final answer-generation step inside each of those
-two nodes branches on `MOCK_LLM`:
-  - **Mock (default, graded):** `retrieve_and_answer` builds
-    `f"Based on the retrieved context: {top_chunk_snippet}"` directly in
-    code from the top retrieved chunk (first ~200 characters), with no LLM
-    call; `direct_answer` returns a fixed canned string. The
-    `AskResponse(answer, sources, confidence)` Pydantic schema is populated
-    deterministically in code in both cases (`sources` = retrieved chunk ids
-    for policy questions, `[]` for general questions; `confidence = 1.0`) —
-    there's no LLM output to validate, since none was generated.
-  - **Optional `MOCK_LLM=0` extension:** the same two nodes instead call
-    `llm_client.call_llm()` (Groq free tier) with the structured prompt from
-    `prompt_template.py` (role → context → task → format → length, with an
-    explicit negative constraint and a few-shot example), parse the raw
-    text as JSON, and validate it against the `AskResponse` schema. If
-    validation fails, `graph.py::_call_llm_with_schema_retries()` retries up
-    to 2 additional times with a corrective instruction appended to the
-    prompt before giving up and returning a clearly marked error
-    (`HTTPException 502` from `main.py`).
-
-**Data flow summary:**
-`docs/*.txt` → `ingest.py` (chunk + embed) → ChromaDB `zepto_policies`
-collection → `classify_intent` node → conditional edge →
-`retrieve_and_answer` (queries ChromaDB, then mock-templates or
-LLM-generates) **or** `direct_answer` (mock-canned or LLM-generates) →
-`AskResponse` (validated) → FastAPI `POST /ask` → JSON response to client.
-
-## What changes under `MOCK_LLM=0`
-
-| Stage | Mock (`MOCK_LLM` default) | Real LLM (`MOCK_LLM=0`) |
-|---|---|---|
-| `classify_intent` | Keyword heuristic, no call | LLM classifies (falls back to heuristic on API failure) |
-| Retrieval (ChromaDB) | Runs for real either way | Runs for real either way |
-| `retrieve_and_answer` generation | Canned `"Based on the retrieved context: ..."` template | LLM answers grounded in retrieved chunks via the structured prompt |
-| `direct_answer` generation | Fixed canned string | LLM answers directly, no retrieval |
-| Schema population | Built deterministically in code | Parsed from LLM JSON output, retried up to 2x on validation failure |
-| Network/API key | None required | Requires `GROQ_API_KEY` (or another free-tier LLM API) |
-
-## Optional extensions attempted
-
-- Real-LLM path (`MOCK_LLM=0`): code is present and wired in
-  (`llm_client.py`, prompt templates, retry logic) but was **not**
-  exercised against a live Groq key for this submission — the graded
-  baseline (`MOCK_LLM` default) is what was verified end-to-end.
-- Hugging Face Spaces deployment: not attempted; the Dockerfile builds and
-  runs `POST /ask` locally, which is the required baseline.
