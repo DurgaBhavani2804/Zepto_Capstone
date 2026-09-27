@@ -49,6 +49,10 @@ print(f"Final dataset size: {len(df)}")
 conn = sqlite3.connect("books.db")
 cursor = conn.cursor()
 
+# Clear old data so re-running the script doesn't create duplicates
+cursor.execute("DROP TABLE IF EXISTS books")
+cursor.execute("DROP TABLE IF EXISTS categories")
+
 cursor.execute("""CREATE TABLE IF NOT EXISTS categories (
     category_id INTEGER PRIMARY KEY,
     category_name TEXT UNIQUE
